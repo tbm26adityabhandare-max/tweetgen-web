@@ -5,6 +5,9 @@ const MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const FREE_PER_USER = Number(process.env.FREE_GENERATIONS || 2);     // free generations per visitor
 const QUOTA_DAYS = Number(process.env.QUOTA_RESET_DAYS || 30);        // when a visitor's free uses reset
 const DAILY_CAP = Number(process.env.DAILY_SITE_CAP || 200);          // max generations per day for the whole site
+const PRO_CODES = String(process.env.PRO_CODES || "").split(",").map(c => c.trim().toUpperCase()).filter(Boolean); // paid access codes
+const PRO_DAILY = Number(process.env.PRO_DAILY_LIMIT || 50);           // fair-use cap per Pro code per day
+const isPro = code => !!code && PRO_CODES.includes(String(code).trim().toUpperCase());
 
 // ---------- Storage: Upstash Redis if configured (needed on Vercel), else memory (fine on Railway) ----------
 const UP_URL = process.env.UPSTASH_REDIS_REST_URL, UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -133,6 +136,7 @@ async function runAgent(b, apiKey) {
 
 // ---------- Request handler (framework-agnostic) ----------
 async function handleGenerate(body, headers) {
+  if (body.checkCode !== undefined) return [200, { valid: isPro(body.checkCode) }];
   const tones = ["Viral", "Witty", "Professional", "Emotional", "Casual"];
   const b = {
     topic: clip(body.topic, 200), genre: clip(body.genre, 30) || "Insight",
@@ -142,6 +146,18 @@ async function handleGenerate(body, headers) {
     includeUrl: !!body.includeUrl, research: body.research !== false
   };
   if (!b.topic) return [400, { error: "Add a topic first." }];
+
+  // Paid users: access code from the Pricing page
+  if (body.proCode) {
+    if (!isPro(body.proCode)) return [403, { error: "That access code isn't valid. Check it, or contact us." }];
+    const proKey = `tg:pro:${String(body.proCode).trim().toUpperCase()}:${today()}`;
+    if ((await getCount(proKey)) >= PRO_DAILY) return [429, { error: `You've reached today's fair-use limit of ${PRO_DAILY} generations. It resets tomorrow.` }];
+    try {
+      const out = await runAgent(b, process.env.GROQ_API_KEY);
+      await addCount(proKey, 2 * 86400);
+      return [200, { ...out, pro: true }];
+    } catch (e) { return [e.status || 500, { error: e.message }]; }
+  }
 
   // Visitors who bring their own key are not limited and do not spend yours
   const ownKey = clip(body.apiKey, 200);
